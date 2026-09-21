@@ -253,17 +253,70 @@ def login_form():
         </body>
     </html>
     """)
-MAX_LOGIN_FAIL = 3
 
+MAX_LOGIN_FAIL = 5
+BASE_DELAY = 2       
+MAX_DELAY = 60   
 count = {}
-
+next_login_time = {}
 locked_users = set()
+
+RATE_LIMIT_REQUESTS = 5
+RATE_LIMIT_WINDOW = 60
+
+rate_limit_store = {}
+
+def check_rate_limit(ip_address):
+    current_time = time.time()
+
+    if ip_address not in rate_limit_store:
+        rate_limit_store[ip_address] = []
+
+    requests = rate_limit_store[ip_address]
+
+    requests = [
+        request_time
+        for request_time in requests
+        if current_time - request_time < RATE_LIMIT_WINDOW
+    ]
+
+    rate_limit_store[ip_address] = requests
+
+    if len(requests) >= RATE_LIMIT_REQUESTS:
+        oldest_request = requests[0]
+
+        retry_after = int(
+            RATE_LIMIT_WINDOW
+            - (current_time - oldest_request)
+        ) + 1
+
+        return False, retry_after
+
+    requests.append(current_time)
+
+    return True, 0
 
 @app.post("/login", response_class=HTMLResponse)
 def login(
+    request: Request,
     username: str = Form(...),
     password: str = Form(...)
 ):
+    client_ip = request.client.host
+
+    allowed, retry_after = check_rate_limit(client_ip)
+
+    if not allowed:
+        return HTMLResponse(
+            f"""
+            <h2>429 - Too Many Requests</h2>
+            <p>Try again after {retry_after} seconds.</p>
+            """,
+            status_code=429,
+            headers={
+                "Retry-After": str(retry_after)
+            }
+        )
     connect = sqlite3.connect(f"{db_name}.db")
     cursor = connect.cursor()
 
@@ -281,7 +334,6 @@ def login(
     connect.close()
 
     if customer is None:
-
         return HTMLResponse(
             """
             <html>
@@ -302,7 +354,6 @@ def login(
         )
 
     if username in locked_users:
-
         return HTMLResponse(
             """
             <html>
@@ -321,23 +372,56 @@ def login(
             status_code=423
         )
 
+    current_time = time.time()
+
+    blocked_until = next_login_time.get(username, 0)
+
+    if current_time < blocked_until:
+
+        retry_after = int(blocked_until - current_time) + 1
+
+        return HTMLResponse(
+            f"""
+            <html>
+                <body>
+
+                    <h2>429 - Too Many Requests</h2>
+
+                    <p>
+                        Too many failed login attempts.
+                    </p>
+
+                    <p>
+                        Please wait {retry_after} seconds
+                        before trying again.
+                    </p>
+
+                </body>
+            </html>
+            """,
+            status_code=429,
+            headers={
+                "Retry-After": str(retry_after)
+            }
+        )
+
     database_password = customer[2]
 
     if password != database_password:
 
-        # Nếu user chưa có trong count
         if username not in count:
             count[username] = 0
 
-        # Tăng số lần login sai
         count[username] += 1
 
-        remaining = MAX_LOGIN_FAIL - count[username]
+        failed_attempts = count[username]
 
-
-        if count[username] >= MAX_LOGIN_FAIL:
+        
+        if failed_attempts >= MAX_LOGIN_FAIL:
 
             locked_users.add(username)
+
+            next_login_time.pop(username, None)
 
             return HTMLResponse(
                 f"""
@@ -348,7 +432,7 @@ def login(
 
                         <p>
                             Failed login attempts:
-                            {count[username]}
+                            {failed_attempts}
                         </p>
 
                         <p>
@@ -362,7 +446,21 @@ def login(
                 status_code=423
             )
 
-        # Password sai nhưng chưa bị lock
+       
+        delay = BASE_DELAY * (2 ** (failed_attempts - 1))
+
+        # Không cho delay vượt MAX_DELAY
+        delay = min(delay, MAX_DELAY)
+
+        # Ghi lại thời điểm được login tiếp
+        next_login_time[username] = (
+            time.time() + delay
+        )
+
+        remaining = (
+            MAX_LOGIN_FAIL - failed_attempts
+        )
+
         return HTMLResponse(
             f"""
             <html>
@@ -376,12 +474,18 @@ def login(
 
                     <p>
                         Failed attempts:
-                        {count[username]}
+                        {failed_attempts}
                     </p>
 
                     <p>
                         Remaining attempts:
                         {remaining}
+                    </p>
+
+                    <p>
+                        You must wait
+                        {delay} seconds
+                        before trying again.
                     </p>
 
                     <form action="/login-form" method="get">
@@ -395,11 +499,17 @@ def login(
                 </body>
             </html>
             """,
-            status_code=401
+            status_code=401,
+            headers={
+                "Retry-After": str(delay)
+            }
         )
 
-  
+    
     count[username] = 0
+
+    # Xóa backoff
+    next_login_time.pop(username, None)
 
     session_id = create_session(username)
 
@@ -416,7 +526,6 @@ def login(
     )
 
     return response
-
 @app.get("/profile", response_class=HTMLResponse)
 def profile(request: Request):
 
