@@ -2,21 +2,21 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 import uvicorn
 import sqlite3
-
-# JWT
 import json
 import base64
 import hmac
 import hashlib
 import time
-
-# Session
 import secrets
 
 
+# =========================================================
+# APP + DATABASE
+# =========================================================
+
 db_name = "database"
 
-app = FastAPI(title="user_demo")
+app = FastAPI(title="Authentication Security Demo")
 
 
 def create_database():
@@ -31,6 +31,8 @@ def create_database():
         )
     """)
 
+    # Demo only.
+    # Production phải lưu password hash, không lưu plaintext.
     users = [
         ("admin", "admin123"),
         ("user", "user123"),
@@ -38,10 +40,13 @@ def create_database():
     ]
 
     for username, password in users:
-        cursor.execute("""
+        cursor.execute(
+            """
             INSERT OR IGNORE INTO customers(username, password)
             VALUES(?, ?)
-        """, (username, password))
+            """,
+            (username, password)
+        )
 
     connect.commit()
     connect.close()
@@ -50,16 +55,18 @@ def create_database():
 create_database()
 
 
-def authenticate_user(username, password):
-
+def find_user(username):
     connect = sqlite3.connect(f"{db_name}.db")
     cursor = connect.cursor()
 
-    cursor.execute("""
-        SELECT id, username
+    cursor.execute(
+        """
+        SELECT id, username, password
         FROM customers
-        WHERE username = ? AND password = ?
-    """, (username, password))
+        WHERE username = ?
+        """,
+        (username,)
+    )
 
     user = cursor.fetchone()
 
@@ -68,6 +75,29 @@ def authenticate_user(username, password):
     return user
 
 
+def authenticate_user(username, password):
+    connect = sqlite3.connect(f"{db_name}.db")
+    cursor = connect.cursor()
+
+    cursor.execute(
+        """
+        SELECT id, username
+        FROM customers
+        WHERE username = ? AND password = ?
+        """,
+        (username, password)
+    )
+
+    user = cursor.fetchone()
+
+    connect.close()
+
+    return user
+
+
+# =========================================================
+# JWT
+# =========================================================
 
 JWT_SECRET = "super-secret-key-change-this"
 
@@ -82,7 +112,6 @@ def base64url_decode(data: str):
 
 
 def create_jwt(username):
-
     header = {
         "alg": "HS256",
         "typ": "JWT"
@@ -112,19 +141,15 @@ def create_jwt(username):
 
     signature_encoded = base64url_encode(signature)
 
-    token = (
+    return (
         f"{header_encoded}."
         f"{payload_encoded}."
         f"{signature_encoded}"
     )
 
-    return token
-
 
 def verify_jwt(token):
-
     try:
-
         header_encoded, payload_encoded, signature_encoded = token.split(".")
 
         message = f"{header_encoded}.{payload_encoded}"
@@ -135,7 +160,9 @@ def verify_jwt(token):
             hashlib.sha256
         ).digest()
 
-        received_signature = base64url_decode(signature_encoded)
+        received_signature = base64url_decode(
+            signature_encoded
+        )
 
         if not hmac.compare_digest(
             expected_signature,
@@ -156,12 +183,14 @@ def verify_jwt(token):
         return None
 
 
+# =========================================================
+# SESSION
+# =========================================================
 
 sessions = {}
 
 
 def create_session(username):
-
     session_id = secrets.token_urlsafe(32)
 
     sessions[session_id] = {
@@ -173,7 +202,6 @@ def create_session(username):
 
 
 def get_session(request: Request):
-
     session_id = request.cookies.get("session_id")
 
     if not session_id:
@@ -182,141 +210,65 @@ def get_session(request: Request):
     return sessions.get(session_id)
 
 
+# =========================================================
+# LOGIN SECURITY SETTINGS
+# =========================================================
 
-@app.get("/", response_class=HTMLResponse)
-def home():
+# Account Lock + Exponential Backoff
+MAX_LOGIN_FAIL = 5
+BASE_DELAY = 2
+MAX_DELAY = 60
 
-    return HTMLResponse("""
-    <html>
-        <body>
+# username -> số lần password sai
+count = {}
 
-            <h1>Authentication Demo</h1>
+# username -> thời điểm được phép thử login tiếp
+next_login_time = {}
 
-            <h2>Session Authentication</h2>
-
-            <a href="/login-form">
-                Login using Session
-            </a>
-
-            <br><br>
-
-            <h2>JWT Authentication</h2>
-
-            <a href="/jwt-login-form">
-                Login using JWT
-            </a>
-
-        </body>
-    </html>
-    """)
+# các username đã bị khóa
+locked_users = set()
 
 
-LOGIN_PAGE_STYLE = """
-<style>
-    body {
-        font-family: Arial, sans-serif;
-        max-width: 900px;
-        margin: 40px auto;
-        padding: 0 20px;
-        background: #f5f7fb;
-        color: #1f2937;
-    }
+# Rate Limit
+RATE_LIMIT_REQUESTS = 5
+RATE_LIMIT_WINDOW = 60
 
-    .login-card,
-    .security-card {
-        background: white;
-        border: 1px solid #dbe2ea;
-        border-radius: 12px;
-        padding: 22px;
-        margin-bottom: 20px;
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.06);
-    }
+# IP -> [request_time_1, request_time_2, ...]
+rate_limit_store = {}
 
-    .security-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-        gap: 16px;
-    }
 
-    .status-box {
-        border-radius: 10px;
-        padding: 16px;
-        border: 2px solid #dbe2ea;
-    }
-
-    .rate-limit-box {
-        border-color: #2563eb;
-        background: #eff6ff;
-    }
-
-    .backoff-box {
-        border-color: #f59e0b;
-        background: #fffbeb;
-    }
-
-    .danger-box {
-        border-color: #dc2626;
-        background: #fef2f2;
-    }
-
-    .success-box {
-        border-color: #16a34a;
-        background: #f0fdf4;
-    }
-
-    .metric {
-        font-size: 28px;
-        font-weight: bold;
-        margin: 8px 0;
-    }
-
-    .small {
-        color: #64748b;
-        font-size: 14px;
-    }
-
-    input {
-        width: 100%;
-        box-sizing: border-box;
-        padding: 10px;
-        margin: 6px 0 14px;
-    }
-
-    button {
-        padding: 10px 18px;
-        cursor: pointer;
-    }
-
-    code {
-        background: #e5e7eb;
-        padding: 2px 5px;
-        border-radius: 4px;
-    }
-</style>
-"""
-
+# =========================================================
+# RATE LIMIT FUNCTIONS
+# =========================================================
 
 def cleanup_rate_limit(ip_address):
     current_time = time.time()
 
-    requests = rate_limit_store.get(ip_address, [])
+    requests = rate_limit_store.get(
+        ip_address,
+        []
+    )
 
-    requests = [
+    active_requests = [
         request_time
         for request_time in requests
         if current_time - request_time < RATE_LIMIT_WINDOW
     ]
 
-    rate_limit_store[ip_address] = requests
+    rate_limit_store[ip_address] = active_requests
 
-    return requests
+    return active_requests
 
 
 def get_rate_limit_status(ip_address):
     requests = cleanup_rate_limit(ip_address)
 
     used = len(requests)
-    remaining = max(RATE_LIMIT_REQUESTS - used, 0)
+
+    remaining = max(
+        RATE_LIMIT_REQUESTS - used,
+        0
+    )
 
     if requests:
         reset_after = max(
@@ -332,140 +284,12 @@ def get_rate_limit_status(ip_address):
     return used, remaining, reset_after
 
 
-@app.get("/login-form", response_class=HTMLResponse)
-def login_form(request: Request):
-
-    client_ip = request.client.host
-
-    used, remaining, reset_after = get_rate_limit_status(
-        client_ip
-    )
-
-    return HTMLResponse(f"""
-    <html>
-        <head>
-            <title>Session Login Security Demo</title>
-            {LOGIN_PAGE_STYLE}
-        </head>
-
-        <body>
-
-            <h1>Session Authentication Demo</h1>
-
-            <div class="security-card">
-                <h2>Security Protection Status</h2>
-
-                <div class="security-grid">
-
-                    <div class="status-box rate-limit-box">
-                        <h3>Rate Limit</h3>
-
-                        <div class="metric">
-                            {used} / {RATE_LIMIT_REQUESTS}
-                        </div>
-
-                        <p>
-                            Login requests used in the current
-                            {RATE_LIMIT_WINDOW}-second window.
-                        </p>
-
-                        <p>
-                            Remaining requests:
-                            <strong>{remaining}</strong>
-                        </p>
-
-                        <p>
-                            Window reset:
-                            <strong>
-                                {reset_after if reset_after else "No active window"}
-                            </strong>
-                        </p>
-
-                        <p class="small">
-                            Client IP: {client_ip}
-                        </p>
-                    </div>
-
-                    <div class="status-box backoff-box">
-                        <h3>Exponential Backoff</h3>
-
-                        <div class="metric">
-                            2s → 4s → 8s → 16s
-                        </div>
-
-                        <p>
-                            Each incorrect password increases
-                            the waiting time.
-                        </p>
-
-                        <p>
-                            Maximum delay:
-                            <strong>{MAX_DELAY}s</strong>
-                        </p>
-
-                        <p>
-                            Account locks after:
-                            <strong>{MAX_LOGIN_FAIL} failures</strong>
-                        </p>
-                    </div>
-
-                </div>
-            </div>
-
-            <div class="login-card">
-
-                <h2>Session Login</h2>
-
-                <form action="/login" method="post">
-
-                    <label>Username</label>
-
-                    <input
-                        name="username"
-                        type="text"
-                        required
-                    >
-
-                    <label>Password</label>
-
-                    <input
-                        name="password"
-                        type="password"
-                        required
-                    >
-
-                    <button type="submit">
-                        Login
-                    </button>
-
-                </form>
-
-            </div>
-
-        </body>
-    </html>
-    """)
-
-MAX_LOGIN_FAIL = 5
-BASE_DELAY = 2       
-MAX_DELAY = 60   
-count = {}
-next_login_time = {}
-locked_users = set()
-
-RATE_LIMIT_REQUESTS = 5
-RATE_LIMIT_WINDOW = 60
-
-rate_limit_store = {}
-
 def check_rate_limit(ip_address):
-
     requests = cleanup_rate_limit(ip_address)
 
     current_time = time.time()
 
     if len(requests) >= RATE_LIMIT_REQUESTS:
-
         oldest_request = requests[0]
 
         retry_after = int(
@@ -479,586 +303,312 @@ def check_rate_limit(ip_address):
 
     return True, 0, len(requests)
 
-@app.post("/login", response_class=HTMLResponse)
-def login(
-    request: Request,
-    username: str = Form(...),
-    password: str = Form(...)
-):
-    client_ip = request.client.host
 
-    allowed, retry_after, rate_used = check_rate_limit(client_ip)
+# =========================================================
+# EXPONENTIAL BACKOFF FUNCTIONS
+# =========================================================
 
-    if not allowed:
-        return HTMLResponse(
-            f"""
-            <html>
-                <head>
-                    <title>Rate Limit Triggered</title>
-                    {LOGIN_PAGE_STYLE}
-                </head>
+def get_backoff_status(username):
+    failed_attempts = count.get(username, 0)
 
-                <body>
-
-                    <h1>Login Protection Triggered</h1>
-
-                    <div class="security-card danger-box">
-
-                        <h2>429 - Rate Limit</h2>
-
-                        <div class="metric">
-                            {rate_used} / {RATE_LIMIT_REQUESTS}
-                            requests
-                        </div>
-
-                        <p>
-                            This IP has reached the login request
-                            limit for the current
-                            {RATE_LIMIT_WINDOW}-second window.
-                        </p>
-
-                        <p>
-                            Retry after:
-                            <strong id="countdown">
-                                {retry_after}
-                            </strong>
-                            seconds
-                        </p>
-
-                        <p class="small">
-                            Client IP: {client_ip}
-                        </p>
-
-                    </div>
-
-                    <div class="security-card">
-
-                        <h3>What happened?</h3>
-
-                        <p>
-                            Rate Limit is checked before the
-                            database login logic.
-                        </p>
-
-                        <p>
-                            Limit:
-                            <code>
-                                {RATE_LIMIT_REQUESTS} requests /
-                                {RATE_LIMIT_WINDOW} seconds / IP
-                            </code>
-                        </p>
-
-                        <a href="/login-form">
-                            Return to login page
-                        </a>
-
-                    </div>
-
-                    <script>
-                        let seconds = {retry_after};
-
-                        const countdown =
-                            document.getElementById("countdown");
-
-                        const timer = setInterval(() => {{
-                            seconds--;
-
-                            if (seconds <= 0) {{
-                                countdown.textContent = "0";
-                                clearInterval(timer);
-                                return;
-                            }}
-
-                            countdown.textContent = seconds;
-                        }}, 1000);
-                    </script>
-
-                </body>
-            </html>
-            """,
-            status_code=429,
-            headers={{
-                "Retry-After": str(retry_after)
-            }}
-        )
-    connect = sqlite3.connect(f"{db_name}.db")
-    cursor = connect.cursor()
-
-    cursor.execute(
-        """
-        SELECT id, username, password
-        FROM customers
-        WHERE username = ?
-        """,
-        (username,)
+    blocked_until = next_login_time.get(
+        username,
+        0
     )
 
-    customer = cursor.fetchone()
+    retry_after = 0
 
-    connect.close()
+    if time.time() < blocked_until:
+        retry_after = int(
+            blocked_until - time.time()
+        ) + 1
 
-    if customer is None:
-        return HTMLResponse(
-            """
-            <html>
-                <body>
+    return failed_attempts, retry_after
 
-                    <h2>404 - User not found</h2>
 
-                    <form action="/login-form" method="get">
-                        <button type="submit">
-                            Try again
-                        </button>
-                    </form>
+def register_failed_login(username):
+    if username not in count:
+        count[username] = 0
 
-                </body>
-            </html>
-            """,
-            status_code=404
-        )
+    count[username] += 1
 
-    if username in locked_users:
-        return HTMLResponse(
-            """
-            <html>
-                <body>
+    failed_attempts = count[username]
 
-                    <h2>423 - Account Locked</h2>
+    # Nếu quá số lần cho phép -> khóa account
+    if failed_attempts >= MAX_LOGIN_FAIL:
+        locked_users.add(username)
+        next_login_time.pop(username, None)
 
-                    <p>
-                        Your account has been locked
-                        because of too many failed login attempts.
-                    </p>
+        return {
+            "locked": True,
+            "failed_attempts": failed_attempts,
+            "delay": 0,
+            "remaining": 0
+        }
 
-                </body>
-            </html>
-            """,
-            status_code=423
-        )
+    # Exponential Backoff:
+    # 2, 4, 8, 16, ...
+    delay = BASE_DELAY * (
+        2 ** (failed_attempts - 1)
+    )
 
-    current_time = time.time()
+    delay = min(
+        delay,
+        MAX_DELAY
+    )
 
-    blocked_until = next_login_time.get(username, 0)
+    next_login_time[username] = (
+        time.time() + delay
+    )
 
-    if current_time < blocked_until:
+    remaining = (
+        MAX_LOGIN_FAIL - failed_attempts
+    )
 
-        retry_after = int(blocked_until - current_time) + 1
+    return {
+        "locked": False,
+        "failed_attempts": failed_attempts,
+        "delay": delay,
+        "remaining": remaining
+    }
 
-        failed_attempts = count.get(username, 0)
 
-        return HTMLResponse(
-            f"""
-            <html>
-                <head>
-                    <title>Exponential Backoff Active</title>
-                    {LOGIN_PAGE_STYLE}
-                </head>
-
-                <body>
-
-                    <h1>Login Protection Triggered</h1>
-
-                    <div class="security-card backoff-box">
-
-                        <h2>Exponential Backoff Active</h2>
-
-                        <div class="metric">
-                            Wait
-                            <span id="countdown">
-                                {retry_after}
-                            </span>
-                            seconds
-                        </div>
-
-                        <p>
-                            Username:
-                            <strong>{username}</strong>
-                        </p>
-
-                        <p>
-                            Failed attempts:
-                            <strong>{failed_attempts}</strong>
-                        </p>
-
-                        <p>
-                            Backoff progression:
-                            <strong>
-                                2s → 4s → 8s → 16s
-                            </strong>
-                        </p>
-
-                        <p>
-                            The more consecutive password failures,
-                            the longer this account must wait.
-                        </p>
-
-                    </div>
-
-                    <div class="security-card rate-limit-box">
-
-                        <h3>Rate Limit is also active</h3>
-
-                        <p>
-                            This request also counts toward the
-                            IP Rate Limit.
-                        </p>
-
-                        <p>
-                            Current IP usage:
-                            <strong>
-                                {rate_used} /
-                                {RATE_LIMIT_REQUESTS}
-                            </strong>
-                        </p>
-
-                        <p class="small">
-                            Client IP: {client_ip}
-                        </p>
-
-                    </div>
-
-                    <a href="/login-form">
-                        Return to login page
-                    </a>
-
-                    <script>
-                        let seconds = {retry_after};
-
-                        const countdown =
-                            document.getElementById("countdown");
-
-                        const timer = setInterval(() => {{
-                            seconds--;
-
-                            if (seconds <= 0) {{
-                                countdown.textContent = "0";
-                                clearInterval(timer);
-                                return;
-                            }}
-
-                            countdown.textContent = seconds;
-                        }}, 1000);
-                    </script>
-
-                </body>
-            </html>
-            """,
-            status_code=429,
-            headers={{
-                "Retry-After": str(retry_after)
-            }}
-        )
-
-    database_password = customer[2]
-
-    if password != database_password:
-
-        if username not in count:
-            count[username] = 0
-
-        count[username] += 1
-
-        failed_attempts = count[username]
-
-        
-        if failed_attempts >= MAX_LOGIN_FAIL:
-
-            locked_users.add(username)
-
-            next_login_time.pop(username, None)
-
-            return HTMLResponse(
-                f"""
-                <html>
-                    <head>
-                        <title>Account Locked</title>
-                        {LOGIN_PAGE_STYLE}
-                    </head>
-
-                    <body>
-
-                        <h1>Security Protection Status</h1>
-
-                        <div class="security-card danger-box">
-
-                            <h2>423 - Account Locked</h2>
-
-                            <div class="metric">
-                                {failed_attempts}
-                                failed attempts
-                            </div>
-
-                            <p>
-                                Account
-                                <strong>{username}</strong>
-                                has reached the maximum number
-                                of failed login attempts.
-                            </p>
-
-                        </div>
-
-                        <div class="security-grid">
-
-                            <div class="status-box backoff-box">
-                                <h3>Exponential Backoff</h3>
-                                <p>
-                                    Backoff increased after each
-                                    failed password attempt.
-                                </p>
-                                <p>
-                                    2s → 4s → 8s → 16s
-                                </p>
-                            </div>
-
-                            <div class="status-box rate-limit-box">
-                                <h3>Rate Limit</h3>
-                                <p>
-                                    Current IP usage:
-                                    <strong>
-                                        {rate_used} /
-                                        {RATE_LIMIT_REQUESTS}
-                                    </strong>
-                                </p>
-                                <p>
-                                    Window:
-                                    {RATE_LIMIT_WINDOW} seconds
-                                </p>
-                            </div>
-
-                        </div>
-
-                    </body>
-                </html>
-                """,
-                status_code=423
-            )
-
-       
-        delay = BASE_DELAY * (2 ** (failed_attempts - 1))
-
-        # Không cho delay vượt MAX_DELAY
-        delay = min(delay, MAX_DELAY)
-
-        # Ghi lại thời điểm được login tiếp
-        next_login_time[username] = (
-            time.time() + delay
-        )
-
-        remaining = (
-            MAX_LOGIN_FAIL - failed_attempts
-        )
-
-        return HTMLResponse(
-            f"""
-            <html>
-                <head>
-                    <title>Login Failed</title>
-                    {LOGIN_PAGE_STYLE}
-                </head>
-
-                <body>
-
-                    <h1>Login Failed</h1>
-
-                    <div class="security-grid">
-
-                        <div class="status-box backoff-box">
-
-                            <h2>Exponential Backoff</h2>
-
-                            <div class="metric">
-                                {delay} seconds
-                            </div>
-
-                            <p>
-                                Failed attempts:
-                                <strong>{failed_attempts}</strong>
-                            </p>
-
-                            <p>
-                                Remaining before account lock:
-                                <strong>{remaining}</strong>
-                            </p>
-
-                            <p>
-                                Next login attempt is allowed in:
-                                <strong id="countdown">
-                                    {delay}
-                                </strong>
-                                seconds
-                            </p>
-
-                        </div>
-
-                        <div class="status-box rate-limit-box">
-
-                            <h2>Rate Limit</h2>
-
-                            <div class="metric">
-                                {rate_used} /
-                                {RATE_LIMIT_REQUESTS}
-                            </div>
-
-                            <p>
-                                Requests used in the current
-                                {RATE_LIMIT_WINDOW}-second window.
-                            </p>
-
-                            <p>
-                                Client IP:
-                                <strong>{client_ip}</strong>
-                            </p>
-
-                        </div>
-
-                    </div>
-
-                    <div class="security-card danger-box">
-
-                        <h2>401 - Unauthorized</h2>
-
-                        <p>
-                            Incorrect password for
-                            <strong>{username}</strong>.
-                        </p>
-
-                        <p>
-                            Exponential Backoff has now been applied.
-                        </p>
-
-                        <form action="/login-form" method="get">
-                            <button type="submit">
-                                Return to login
-                            </button>
-                        </form>
-
-                    </div>
-
-                    <script>
-                        let seconds = {delay};
-
-                        const countdown =
-                            document.getElementById("countdown");
-
-                        const timer = setInterval(() => {{
-                            seconds--;
-
-                            if (seconds <= 0) {{
-                                countdown.textContent = "0";
-                                clearInterval(timer);
-                                return;
-                            }}
-
-                            countdown.textContent = seconds;
-                        }}, 1000);
-                    </script>
-
-                </body>
-            </html>
-            """,
-            status_code=401,
-            headers={{
-                "Retry-After": str(delay)
-            }}
-        )
-
-    
+def reset_login_security(username):
     count[username] = 0
-
-    # Xóa backoff
     next_login_time.pop(username, None)
 
-    session_id = create_session(username)
 
-    response = RedirectResponse(
-        url="/profile",
-        status_code=303
+# =========================================================
+# HTML HELPERS
+# =========================================================
+
+def rate_limit_html(
+    client_ip,
+    used,
+    remaining,
+    reset_after,
+    title="RATE LIMIT"
+):
+    reset_text = (
+        f"{reset_after} seconds"
+        if reset_after > 0
+        else "No active window"
     )
 
-    response.set_cookie(
-        key="session_id",
-        value=session_id,
-        httponly=True,
-        samesite="lax"
+    return f"""
+    <fieldset>
+        <legend>
+            <strong>{title}</strong>
+        </legend>
+
+        <h3>Request Limiting Protection</h3>
+
+        <p>
+            <strong>Đây là khu vực Rate Limit.</strong>
+        </p>
+
+        <p>
+            Rate Limit kiểm soát số request gửi từ một IP
+            trong một khoảng thời gian.
+        </p>
+
+        <p>
+            Client IP:
+            <strong>{client_ip}</strong>
+        </p>
+
+        <p>
+            Requests:
+            <strong>
+                {used} / {RATE_LIMIT_REQUESTS}
+            </strong>
+        </p>
+
+        <p>
+            Remaining Requests:
+            <strong>{remaining}</strong>
+        </p>
+
+        <p>
+            Time Window:
+            <strong>{RATE_LIMIT_WINDOW} seconds</strong>
+        </p>
+
+        <p>
+            Window Reset:
+            <strong>{reset_text}</strong>
+        </p>
+
+        <pre>
+Rate Limit:
+{RATE_LIMIT_REQUESTS} requests / {RATE_LIMIT_WINDOW} seconds / IP
+
+Request quá giới hạn
+        |
+        v
+429 Too Many Requests
+        </pre>
+    </fieldset>
+    """
+
+
+def backoff_general_html():
+    return f"""
+    <fieldset>
+        <legend>
+            <strong>EXPONENTIAL BACKOFF</strong>
+        </legend>
+
+        <h3>Failed Login Delay Protection</h3>
+
+        <p>
+            <strong>
+                Đây là khu vực Exponential Backoff.
+            </strong>
+        </p>
+
+        <p>
+            Exponential Backoff tăng thời gian chờ
+            sau mỗi lần nhập sai password.
+        </p>
+
+        <p>
+            Base Delay:
+            <strong>{BASE_DELAY} seconds</strong>
+        </p>
+
+        <p>
+            Maximum Delay:
+            <strong>{MAX_DELAY} seconds</strong>
+        </p>
+
+        <p>
+            Account Lock:
+            <strong>{MAX_LOGIN_FAIL} failures</strong>
+        </p>
+
+        <pre>
+Sai lần 1 -> Wait 2 seconds
+Sai lần 2 -> Wait 4 seconds
+Sai lần 3 -> Wait 8 seconds
+Sai lần 4 -> Wait 16 seconds
+Sai lần 5 -> Account Locked
+        </pre>
+    </fieldset>
+    """
+
+
+def backoff_status_html(
+    username,
+    failed_attempts,
+    delay,
+    remaining=None
+):
+    remaining_html = ""
+
+    if remaining is not None:
+        remaining_html = f"""
+        <p>
+            Remaining Attempts:
+            <strong>{remaining}</strong>
+        </p>
+        """
+
+    return f"""
+    <fieldset>
+        <legend>
+            <strong>EXPONENTIAL BACKOFF</strong>
+        </legend>
+
+        <h3>Failed Login Delay Protection</h3>
+
+        <p>
+            <strong>
+                Đây là khu vực Exponential Backoff.
+            </strong>
+        </p>
+
+        <p>
+            Username:
+            <strong>{username}</strong>
+        </p>
+
+        <p>
+            Failed Attempts:
+            <strong>{failed_attempts}</strong>
+        </p>
+
+        {remaining_html}
+
+        <p>
+            Current / Remaining Delay:
+            <strong>{delay} seconds</strong>
+        </p>
+
+        <pre>
+Exponential Backoff:
+2s -> 4s -> 8s -> 16s -> ...
+
+Password càng sai nhiều lần
+        |
+        v
+Thời gian chờ càng tăng
+        </pre>
+    </fieldset>
+    """
+
+
+def login_form_html(
+    action,
+    heading,
+    client_ip
+):
+    used, remaining, reset_after = get_rate_limit_status(
+        client_ip
     )
 
-    return response
-@app.get("/profile", response_class=HTMLResponse)
-def profile(request: Request):
-
-    session = get_session(request)
-
-    if not session:
-
-        return RedirectResponse(
-            url="/login-form",
-            status_code=303
-        )
-
-    username = session["username"]
-
-    return HTMLResponse(f"""
+    return f"""
     <html>
+
+        <head>
+            <meta charset="utf-8">
+            <title>{heading}</title>
+        </head>
+
         <body>
 
-            <h1>Session Authentication</h1>
+            <h1>{heading}</h1>
 
             <p>
-                Login success:
-                {username}
+                Trang này dùng HTML thuần để demo rõ
+                Rate Limit và Exponential Backoff.
             </p>
 
-            <form action="/logout" method="post">
+            <hr>
 
-                <button type="submit">
-                    Logout
-                </button>
+            <h2>Security Protection Status</h2>
 
-            </form>
+            {rate_limit_html(
+                client_ip,
+                used,
+                remaining,
+                reset_after
+            )}
 
-        </body>
-    </html>
-    """)
+            <br>
 
+            {backoff_general_html()}
 
-@app.post("/logout")
-def logout(request: Request):
+            <hr>
 
-    session_id = request.cookies.get("session_id")
+            <h2>Login Form</h2>
 
-    if session_id:
+            <form
+                action="{action}"
+                method="post"
+            >
 
-        sessions.pop(
-            session_id,
-            None
-        )
-
-    response = RedirectResponse(
-        url="/login-form",
-        status_code=303
-    )
-
-    response.delete_cookie("session_id")
-
-    return response
-
-
-
-@app.get("/jwt-login-form", response_class=HTMLResponse)
-def jwt_login_form():
-
-    return HTMLResponse("""
-    <html>
-
-        <body>
-
-            <h1>JWT Login</h1>
-
-            <form action="/jwt-login" method="post">
-
-                <label>
-                    Username
-                </label>
+                <label>Username</label>
 
                 <br>
 
@@ -1068,11 +618,9 @@ def jwt_login_form():
                     required
                 >
 
-                <br>
+                <br><br>
 
-                <label>
-                    Password
-                </label>
+                <label>Password</label>
 
                 <br>
 
@@ -1090,31 +638,790 @@ def jwt_login_form():
 
             </form>
 
+            <br>
+
+            <a href="/">
+                Back to Home
+            </a>
+
+        </body>
+
+    </html>
+    """
+
+
+def rate_limit_block_page(
+    client_ip,
+    retry_after,
+    used
+):
+    remaining = 0
+
+    return HTMLResponse(
+        f"""
+        <html>
+
+            <head>
+                <meta charset="utf-8">
+                <title>Rate Limit Triggered</title>
+            </head>
+
+            <body>
+
+                <h1>
+                    429 - Too Many Requests
+                </h1>
+
+                {rate_limit_html(
+                    client_ip,
+                    used,
+                    remaining,
+                    retry_after,
+                    title="RATE LIMIT - ACTIVE"
+                )}
+
+                <br>
+
+                <fieldset>
+                    <legend>
+                        <strong>
+                            EXPONENTIAL BACKOFF
+                        </strong>
+                    </legend>
+
+                    <p>
+                        Đây là khu vực Exponential Backoff.
+                    </p>
+
+                    <p>
+                        Tuy nhiên request này đã bị
+                        <strong>Rate Limit chặn trước</strong>,
+                        nên hệ thống chưa cần kiểm tra
+                        Exponential Backoff.
+                    </p>
+                </fieldset>
+
+                <br>
+
+                <a href="/login-form">
+                    Session Login
+                </a>
+
+                <br><br>
+
+                <a href="/jwt-login-form">
+                    JWT Login
+                </a>
+
+            </body>
+
+        </html>
+        """,
+        status_code=429,
+        headers={
+            "Retry-After": str(retry_after)
+        }
+    )
+
+
+def backoff_block_page(
+    username,
+    retry_after,
+    failed_attempts,
+    client_ip,
+    rate_used
+):
+    rate_remaining = max(
+        RATE_LIMIT_REQUESTS - rate_used,
+        0
+    )
+
+    _, _, reset_after = get_rate_limit_status(
+        client_ip
+    )
+
+    return HTMLResponse(
+        f"""
+        <html>
+
+            <head>
+                <meta charset="utf-8">
+                <title>Exponential Backoff Active</title>
+            </head>
+
+            <body>
+
+                <h1>
+                    Login Temporarily Delayed
+                </h1>
+
+                {backoff_status_html(
+                    username,
+                    failed_attempts,
+                    retry_after
+                )}
+
+                <br>
+
+                {rate_limit_html(
+                    client_ip,
+                    rate_used,
+                    rate_remaining,
+                    reset_after
+                )}
+
+                <br>
+
+                <p>
+                    <strong>Phân biệt:</strong>
+                </p>
+
+                <pre>
+Exponential Backoff
+= kiểm soát thời gian chờ theo username / login fail
+
+Rate Limit
+= kiểm soát số request theo IP
+                </pre>
+
+                <a href="/login-form">
+                    Back to Session Login
+                </a>
+
+            </body>
+
+        </html>
+        """,
+        status_code=429,
+        headers={
+            "Retry-After": str(retry_after)
+        }
+    )
+
+
+def wrong_password_page(
+    username,
+    failed_attempts,
+    remaining_attempts,
+    delay,
+    client_ip,
+    rate_used
+):
+    rate_remaining = max(
+        RATE_LIMIT_REQUESTS - rate_used,
+        0
+    )
+
+    _, _, reset_after = get_rate_limit_status(
+        client_ip
+    )
+
+    return HTMLResponse(
+        f"""
+        <html>
+
+            <head>
+                <meta charset="utf-8">
+                <title>Login Failed</title>
+            </head>
+
+            <body>
+
+                <h1>
+                    401 - Unauthorized
+                </h1>
+
+                <p>
+                    Incorrect password.
+                </p>
+
+                <hr>
+
+                {backoff_status_html(
+                    username,
+                    failed_attempts,
+                    delay,
+                    remaining_attempts
+                )}
+
+                <br>
+
+                {rate_limit_html(
+                    client_ip,
+                    rate_used,
+                    rate_remaining,
+                    reset_after
+                )}
+
+                <hr>
+
+                <h2>
+                    Hai cơ chế khác nhau như thế nào?
+                </h2>
+
+                <pre>
+EXPONENTIAL BACKOFF
+- Theo username / lần login sai
+- Sai càng nhiều -> chờ càng lâu
+- Ví dụ: 2s -> 4s -> 8s -> 16s
+
+
+RATE LIMIT
+- Theo IP / số request
+- Gửi quá nhiều request -> bị chặn
+- Ví dụ: 5 requests / 60 seconds
+                </pre>
+
+                <form
+                    action="/login-form"
+                    method="get"
+                >
+                    <button type="submit">
+                        Try Again
+                    </button>
+                </form>
+
+            </body>
+
+        </html>
+        """,
+        status_code=401,
+        headers={
+            "Retry-After": str(delay)
+        }
+    )
+
+
+def account_locked_page(
+    username,
+    failed_attempts,
+    client_ip,
+    rate_used
+):
+    rate_remaining = max(
+        RATE_LIMIT_REQUESTS - rate_used,
+        0
+    )
+
+    _, _, reset_after = get_rate_limit_status(
+        client_ip
+    )
+
+    return HTMLResponse(
+        f"""
+        <html>
+
+            <head>
+                <meta charset="utf-8">
+                <title>Account Locked</title>
+            </head>
+
+            <body>
+
+                <h1>
+                    423 - Account Locked
+                </h1>
+
+                <fieldset>
+                    <legend>
+                        <strong>
+                            ACCOUNT LOCK
+                        </strong>
+                    </legend>
+
+                    <p>
+                        Username:
+                        <strong>{username}</strong>
+                    </p>
+
+                    <p>
+                        Failed Login Attempts:
+                        <strong>{failed_attempts}</strong>
+                    </p>
+
+                    <p>
+                        Tài khoản đã đạt giới hạn
+                        {MAX_LOGIN_FAIL} lần login sai.
+                    </p>
+                </fieldset>
+
+                <br>
+
+                <fieldset>
+                    <legend>
+                        <strong>
+                            EXPONENTIAL BACKOFF
+                        </strong>
+                    </legend>
+
+                    <p>
+                        Đây là khu vực Exponential Backoff.
+                    </p>
+
+                    <p>
+                        Trước khi account bị khóa,
+                        thời gian chờ đã tăng theo:
+                    </p>
+
+                    <pre>
+2s -> 4s -> 8s -> 16s
+                    </pre>
+                </fieldset>
+
+                <br>
+
+                {rate_limit_html(
+                    client_ip,
+                    rate_used,
+                    rate_remaining,
+                    reset_after
+                )}
+
+            </body>
+
+        </html>
+        """,
+        status_code=423
+    )
+
+
+# =========================================================
+# SHARED LOGIN SECURITY PROCESS
+# =========================================================
+
+def process_login_security(
+    request: Request,
+    username: str,
+    password: str
+):
+    client_ip = request.client.host
+
+    # -----------------------------------------------------
+    # STEP 1: RATE LIMIT
+    # Rate Limit được kiểm tra đầu tiên.
+    # -----------------------------------------------------
+
+    allowed, retry_after, rate_used = check_rate_limit(
+        client_ip
+    )
+
+    if not allowed:
+        return {
+            "success": False,
+            "response": rate_limit_block_page(
+                client_ip,
+                retry_after,
+                rate_used
+            )
+        }
+
+    # -----------------------------------------------------
+    # STEP 2: CHECK USER
+    # -----------------------------------------------------
+
+    customer = find_user(username)
+
+    if customer is None:
+        return {
+            "success": False,
+            "response": HTMLResponse(
+                f"""
+                <html>
+
+                    <head>
+                        <meta charset="utf-8">
+                        <title>User Not Found</title>
+                    </head>
+
+                    <body>
+
+                        <h1>
+                            404 - User Not Found
+                        </h1>
+
+                        <p>
+                            Username does not exist.
+                        </p>
+
+                        <hr>
+
+                        <fieldset>
+                            <legend>
+                                <strong>
+                                    RATE LIMIT
+                                </strong>
+                            </legend>
+
+                            <p>
+                                Request này vẫn được tính
+                                vào Rate Limit theo IP.
+                            </p>
+
+                            <p>
+                                Current Requests:
+                                <strong>
+                                    {rate_used}
+                                    /
+                                    {RATE_LIMIT_REQUESTS}
+                                </strong>
+                            </p>
+                        </fieldset>
+
+                        <br>
+
+                        <fieldset>
+                            <legend>
+                                <strong>
+                                    EXPONENTIAL BACKOFF
+                                </strong>
+                            </legend>
+
+                            <p>
+                                Backoff chưa được áp dụng
+                                vì username không tồn tại.
+                            </p>
+                        </fieldset>
+
+                        <br>
+
+                        <a href="/login-form">
+                            Try Again
+                        </a>
+
+                    </body>
+
+                </html>
+                """,
+                status_code=404
+            )
+        }
+
+    # -----------------------------------------------------
+    # STEP 3: ACCOUNT LOCK
+    # -----------------------------------------------------
+
+    if username in locked_users:
+        failed_attempts = count.get(
+            username,
+            MAX_LOGIN_FAIL
+        )
+
+        return {
+            "success": False,
+            "response": account_locked_page(
+                username,
+                failed_attempts,
+                client_ip,
+                rate_used
+            )
+        }
+
+    # -----------------------------------------------------
+    # STEP 4: EXPONENTIAL BACKOFF
+    # -----------------------------------------------------
+
+    failed_attempts, backoff_retry_after = (
+        get_backoff_status(username)
+    )
+
+    if backoff_retry_after > 0:
+        return {
+            "success": False,
+            "response": backoff_block_page(
+                username,
+                backoff_retry_after,
+                failed_attempts,
+                client_ip,
+                rate_used
+            )
+        }
+
+    # -----------------------------------------------------
+    # STEP 5: CHECK PASSWORD
+    # -----------------------------------------------------
+
+    database_password = customer[2]
+
+    if password != database_password:
+        result = register_failed_login(
+            username
+        )
+
+        if result["locked"]:
+            return {
+                "success": False,
+                "response": account_locked_page(
+                    username,
+                    result["failed_attempts"],
+                    client_ip,
+                    rate_used
+                )
+            }
+
+        return {
+            "success": False,
+            "response": wrong_password_page(
+                username,
+                result["failed_attempts"],
+                result["remaining"],
+                result["delay"],
+                client_ip,
+                rate_used
+            )
+        }
+
+    # -----------------------------------------------------
+    # STEP 6: LOGIN SUCCESS
+    # -----------------------------------------------------
+
+    reset_login_security(username)
+
+    return {
+        "success": True,
+        "username": username,
+        "client_ip": client_ip,
+        "rate_used": rate_used
+    }
+
+
+# =========================================================
+# HOME
+# =========================================================
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return HTMLResponse("""
+    <html>
+
+        <head>
+            <meta charset="utf-8">
+            <title>Authentication Demo</title>
+        </head>
+
+        <body>
+
+            <h1>
+                Authentication Security Demo
+            </h1>
+
+            <p>
+                Project demo:
+            </p>
+
+            <ul>
+                <li>Session ID Authentication</li>
+                <li>JWT Authentication</li>
+                <li>Rate Limit</li>
+                <li>Exponential Backoff</li>
+                <li>Account Lock</li>
+            </ul>
+
+            <hr>
+
+            <h2>
+                Session Authentication
+            </h2>
+
+            <a href="/login-form">
+                Login using Session
+            </a>
+
+            <br><br>
+
+            <h2>
+                JWT Authentication
+            </h2>
+
+            <a href="/jwt-login-form">
+                Login using JWT
+            </a>
+
         </body>
 
     </html>
     """)
 
 
-@app.post("/jwt-login")
-def jwt_login(
+# =========================================================
+# SESSION LOGIN
+# =========================================================
+
+@app.get(
+    "/login-form",
+    response_class=HTMLResponse
+)
+def login_form(request: Request):
+    client_ip = request.client.host
+
+    return HTMLResponse(
+        login_form_html(
+            "/login",
+            "Session Login",
+            client_ip
+        )
+    )
+
+
+@app.post(
+    "/login",
+    response_class=HTMLResponse
+)
+def login(
+    request: Request,
     username: str = Form(...),
     password: str = Form(...)
 ):
-
-    user = authenticate_user(
+    result = process_login_security(
+        request,
         username,
         password
     )
 
-    if not user:
+    if not result["success"]:
+        return result["response"]
 
-        return JSONResponse(
-            {
-                "error": "Invalid username or password"
-            },
-            status_code=401
+    session_id = create_session(username)
+
+    response = RedirectResponse(
+        url="/profile",
+        status_code=303
+    )
+
+    response.set_cookie(
+        key="session_id",
+        value=session_id,
+        httponly=True,
+        samesite="lax"
+    )
+
+    return response
+
+
+@app.get(
+    "/profile",
+    response_class=HTMLResponse
+)
+def profile(request: Request):
+    session = get_session(request)
+
+    if not session:
+        return RedirectResponse(
+            url="/login-form",
+            status_code=303
         )
+
+    username = session["username"]
+
+    return HTMLResponse(
+        f"""
+        <html>
+
+            <head>
+                <meta charset="utf-8">
+                <title>Session Profile</title>
+            </head>
+
+            <body>
+
+                <h1>
+                    Session Authentication
+                </h1>
+
+                <p>
+                    Login success:
+                    <strong>{username}</strong>
+                </p>
+
+                <p>
+                    Exponential Backoff counter
+                    đã được reset sau khi login thành công.
+                </p>
+
+                <p>
+                    Rate Limit vẫn hoạt động theo IP
+                    và time window.
+                </p>
+
+                <form
+                    action="/logout"
+                    method="post"
+                >
+                    <button type="submit">
+                        Logout
+                    </button>
+                </form>
+
+                <br>
+
+                <a href="/">
+                    Home
+                </a>
+
+            </body>
+
+        </html>
+        """
+    )
+
+
+@app.post("/logout")
+def logout(request: Request):
+    session_id = request.cookies.get(
+        "session_id"
+    )
+
+    if session_id:
+        sessions.pop(
+            session_id,
+            None
+        )
+
+    response = RedirectResponse(
+        url="/login-form",
+        status_code=303
+    )
+
+    response.delete_cookie(
+        "session_id"
+    )
+
+    return response
+
+
+# =========================================================
+# JWT LOGIN
+# =========================================================
+
+@app.get(
+    "/jwt-login-form",
+    response_class=HTMLResponse
+)
+def jwt_login_form(request: Request):
+    client_ip = request.client.host
+
+    return HTMLResponse(
+        login_form_html(
+            "/jwt-login",
+            "JWT Login",
+            client_ip
+        )
+    )
+
+
+@app.post("/jwt-login")
+def jwt_login(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...)
+):
+    result = process_login_security(
+        request,
+        username,
+        password
+    )
+
+    if not result["success"]:
+        return result["response"]
 
     token = create_jwt(username)
 
@@ -1133,15 +1440,16 @@ def jwt_login(
     return response
 
 
-@app.get("/jwt-profile", response_class=HTMLResponse)
+@app.get(
+    "/jwt-profile",
+    response_class=HTMLResponse
+)
 def jwt_profile(request: Request):
-
     token = request.cookies.get(
         "access_token"
     )
 
     if not token:
-
         return RedirectResponse(
             url="/jwt-login-form",
             status_code=303
@@ -1150,7 +1458,6 @@ def jwt_profile(request: Request):
     payload = verify_jwt(token)
 
     if not payload:
-
         return RedirectResponse(
             url="/jwt-login-form",
             status_code=303
@@ -1158,40 +1465,59 @@ def jwt_profile(request: Request):
 
     username = payload["sub"]
 
-    return HTMLResponse(f"""
-    <html>
+    return HTMLResponse(
+        f"""
+        <html>
 
-        <body>
+            <head>
+                <meta charset="utf-8">
+                <title>JWT Profile</title>
+            </head>
 
-            <h1>
-                JWT Authentication
-            </h1>
+            <body>
 
-            <p>
-                Login success:
-                {username}
-            </p>
+                <h1>
+                    JWT Authentication
+                </h1>
 
-            <form
-                action="/jwt-logout"
-                method="post"
-            >
+                <p>
+                    Login success:
+                    <strong>{username}</strong>
+                </p>
 
-                <button type="submit">
-                    Logout
-                </button>
+                <p>
+                    JWT hợp lệ và chưa hết hạn.
+                </p>
 
-            </form>
+                <p>
+                    Exponential Backoff counter
+                    đã được reset sau khi login thành công.
+                </p>
 
-        </body>
+                <form
+                    action="/jwt-logout"
+                    method="post"
+                >
+                    <button type="submit">
+                        Logout
+                    </button>
+                </form>
 
-    </html>
-    """)
+                <br>
+
+                <a href="/">
+                    Home
+                </a>
+
+            </body>
+
+        </html>
+        """
+    )
 
 
 @app.post("/jwt-logout")
 def jwt_logout():
-
     response = RedirectResponse(
         url="/jwt-login-form",
         status_code=303
@@ -1204,10 +1530,15 @@ def jwt_logout():
     return response
 
 
+# =========================================================
+# USER LIST
+# =========================================================
 
-@app.get("/users", response_class=HTMLResponse)
+@app.get(
+    "/users",
+    response_class=HTMLResponse
+)
 def user_list():
-
     connect = sqlite3.connect(
         f"{db_name}.db"
     )
@@ -1226,7 +1557,6 @@ def user_list():
     rows = ""
 
     for user in users:
-
         rows += f"""
         <tr>
             <td>{user[0]}</td>
@@ -1234,30 +1564,50 @@ def user_list():
         </tr>
         """
 
-    return HTMLResponse(f"""
-    <html>
+    return HTMLResponse(
+        f"""
+        <html>
 
-        <body>
+            <head>
+                <meta charset="utf-8">
+                <title>User List</title>
+            </head>
 
-            <table border="1">
+            <body>
 
-                <tr>
-                    <th>ID</th>
-                    <th>Username</th>
-                </tr>
+                <h1>
+                    User List
+                </h1>
 
-                {rows}
+                <table border="1">
 
-            </table>
+                    <tr>
+                        <th>ID</th>
+                        <th>Username</th>
+                    </tr>
 
-        </body>
+                    {rows}
 
-    </html>
-    """)
+                </table>
 
+                <br>
+
+                <a href="/">
+                    Home
+                </a>
+
+            </body>
+
+        </html>
+        """
+    )
+
+
+# =========================================================
+# RUN SERVER
+# =========================================================
 
 if __name__ == "__main__":
-
     uvicorn.run(
         app,
         host="127.0.0.1",
